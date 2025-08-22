@@ -100,7 +100,9 @@ func (h *Hub) Run() {
 			if env.Type == "chat_message" {
 				var msg Message
 				if err := json.Unmarshal(env.Payload, &msg); err == nil {
-					h.db.SaveMessage(msg)
+					if err := h.db.SaveMessage(msg); err != nil {
+						log.Println("SaveMessage error:", err)
+					}
 				}
 			}
 			// Рассылаем всем в комнате
