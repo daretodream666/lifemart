@@ -12,12 +12,24 @@ import (
 
 // --- Модель и интерфейс для работы с данными ---
 
+// Envelope - обёртка для сообщений
+type Envelope struct {
+	Type    string          `json:"type"`
+	Room    string          `json:"room"`
+	Payload json.RawMessage `json:"payload"`
+}
+
 // Message - структура сообщения в чате
 type Message struct {
-	Room      string `json:"room"`  // Комната для сообщения
-	Username  string `json:"username"` // Юзернейм отправителя
-	Text      string `json:"text"` // Текст сообщения
-	Timestamp int64  `json:"timestamp"` // Время отправки сообщения(timestamp)
+	Username  string `json:"username"`
+	Text      string `json:"text"`
+	Timestamp int64  `json:"timestamp"`
+}
+
+// TypingStatus - структура сообщения User is typing
+type TypingStatus struct {
+	User   string `json:"user"`
+	Status bool   `json:"status"`
 }
 
 // Repository - интерфейс для работы с хранилищем сообщений
@@ -79,20 +91,28 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.broadcast:
-			var msg Message
-			json.Unmarshal(message, &msg)
-
-			// Сохраняем сообщение в "базу"
-			h.db.SaveMessage(msg)
-
+			var env Envelope
+			if err := json.Unmarshal(message, &env); err != nil {
+				log.Println("unmarshal envelope error:", err)
+				continue
+			}
+			// Сохраняем сообщение в "базу" и ловим ошибки
+			if env.Type == "chat_message" {
+				var msg Message
+				if err := json.Unmarshal(env.Payload, &msg); err == nil {
+					h.db.SaveMessage(msg)
+				}
+			}
 			// Рассылаем всем в комнате
-			for client := range h.rooms[msg.Room] {
+			for client := range h.rooms[env.Room] {
+				if _, ok := h.clients[client]; !ok {
+					continue // клиент уже удалён
+				}
 				select {
 				case client.send <- message:
 				default:
 					// Если буфер отправки полон, клиент отключается
-					close(client.send)
-					delete(h.clients, client)
+					h.unregister <- client // Отключение клиента через unregister
 				}
 			}
 		}
@@ -101,23 +121,60 @@ func (h *Hub) Run() {
 
 // readPump читает сообщения от клиента.
 func (c *Client) readPump() {
+	defer func() {
+		c.hub.unregister <- c
+		c.conn.Close()
+	}() // При ошибке в ReadMessage выходим из readPump, убираем пользователя, закрываем сокет
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			c.hub.unregister <- c
-			break
+			return
 		}
+		// Получаем конверт
+		var wrap Envelope
+		if err := json.Unmarshal(message, &wrap); err != nil {
+			log.Println("unmarshal wrap error:", err)
+		}
+		// Смотрим тип сообщения
+		switch wrap.Type {
+		// Расркываем конверт с сообщением, добавляем время, пакуем, отправляем
+		case "chat_message":
+			var msg Message
+			if err := json.Unmarshal(wrap.Payload, &msg); err != nil {
+				log.Println("Unmarshal chat message error:", err)
+			}
+			msg.Timestamp = time.Now().Unix()
+			jsonMsg, _ := json.Marshal(struct {
+				Type    string  `json:"type"`
+				Room    string  `json:"room"`
+				Payload Message `json:"payload"`
+			}{
+				Type:    wrap.Type,
+				Room:    wrap.Room,
+				Payload: msg,
+			})
 
-		// Обертываем сообщение в структуру Message
-		msg := Message{
-			Room:      c.room,
-			Username:  c.username,
-			Text:      string(message),
-			Timestamp: time.Now().Unix(),
+			c.hub.broadcast <- jsonMsg
+		// Пользователь печатает, упаковали, отправили
+		case "typing_status":
+			var ts TypingStatus
+			if err := json.Unmarshal(wrap.Payload, &ts); err != nil {
+				log.Println("typing status unmarshal error:", err)
+			}
+
+			jsonMsg, _ := json.Marshal(struct {
+				Type    string       `json:"type"`
+				Room    string       `json:"room"`
+				Payload TypingStatus `json:"payload"`
+			}{
+				Type:    wrap.Type,
+				Room:    wrap.Room,
+				Payload: ts,
+			})
+
+			c.hub.broadcast <- jsonMsg
+
 		}
-		
-		jsonMsg, _ := json.Marshal(msg)
-		c.hub.broadcast <- jsonMsg
 	}
 }
 
@@ -131,7 +188,11 @@ func (c *Client) writePump() {
 			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
 		}
-		c.conn.WriteMessage(websocket.TextMessage, message)
+		err := c.conn.WriteMessage(websocket.TextMessage, message)
+		if err != nil {
+			log.Println("WriteMessage error: ")
+			return
+		}
 	}
 }
 
@@ -149,7 +210,7 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		return
 	}
-	
+
 	client := &Client{
 		conn:     conn,
 		hub:      hub,
@@ -157,6 +218,34 @@ func serveWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		room:     room,
 		username: username,
 	}
+
+	// Получаем последние сообщения
+	lastMessages, err := hub.db.GetLastMessages(client.room, 10)
+	if err != nil {
+		log.Println("GetLastMessages error:", err)
+	} else {
+		// Запаковываем каждое последнее сообщение в конверт и отправляем
+		for _, msg := range lastMessages {
+			env := struct {
+				Type    string  `json:"type"`
+				Room    string  `json:"room"`
+				Payload Message `json:"payload"`
+			}{
+				Type:    "chat_message",
+				Room:    client.room,
+				Payload: msg,
+			}
+
+			jsonMsg, err := json.Marshal(env)
+			if err != nil {
+				log.Println("LastMessage Marshal error:")
+				continue
+			}
+
+			client.send <- jsonMsg
+		}
+	}
+	// Только после этого клиент регистрируется и может получать новые сообщения
 	client.hub.register <- client
 
 	go client.writePump()
@@ -175,8 +264,8 @@ func (m *MockDB) GetLastMessages(room string, count int) ([]Message, error) {
 	log.Printf("Запрошены последние %d сообщений для комнаты %s\n", count, room)
 	// Возвращаем несколько тестовых сообщений
 	return []Message{
-		{Room: room, Username: "Alice", Text: "Hello!", Timestamp: time.Now().Unix() - 10},
-		{Room: room, Username: "Bob", Text: "Hi Alice!", Timestamp: time.Now().Unix() - 5},
+		{Username: "Alice", Text: "Hello!", Timestamp: time.Now().Unix() - 10},
+		{Username: "Bob", Text: "Hi Alice!", Timestamp: time.Now().Unix() - 5},
 	}, nil
 }
 
@@ -184,7 +273,7 @@ func main() {
 	db := &MockDB{}
 	hub := NewHub(db)
 	go hub.Run()
-	
+
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		serveWs(hub, w, r)
 	})
